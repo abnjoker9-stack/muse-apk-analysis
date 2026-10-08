@@ -21,9 +21,13 @@ jobs:
           mkdir -p artifacts
           echo "Downloading ${{ inputs.apk_url }}"
           curl -fL --retry 3 -o original_download.bin "${{ inputs.apk_url }}"
-          # Identify actual type
+          # Identify actual type (xxd via python to avoid broken-pipe exits)
           file original_download.bin
-          xxd original_download.bin | head -5
+          python3 -c "
+          d=open('original_download.bin','rb').read(64)
+          print(' '.join(f'{b:02x}' for b in d[:16]))
+          print(repr(d[:16]))
+          "
           # Rename to .apk regardless of extension
           cp original_download.bin Muse.apk
           ls -la Muse.apk
@@ -89,9 +93,9 @@ jobs:
 
       - name: Full manifest dump (minSdk / targetSdk / components)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p decoded
-          apktool d -f -o decoded Muse.apk 2>&1 | tee artifacts/02_apktool_decode.log
+          apktool d -f -o decoded Muse.apk 2>&1 | tee artifacts/02_apktool_decode.log || true
           if [ -f decoded/AndroidManifest.xml ]; then
             cp decoded/AndroidManifest.xml artifacts/AndroidManifest.xml
             echo "### minSdk / targetSdk / uses-sdk"
@@ -105,7 +109,7 @@ jobs:
 
       - name: Check APK structure / is it really an APK?
         run: |
-          set -euo pipefail
+          set -uo pipefail
           {
             echo "### zip contents (top-level)"
             unzip -l Muse.apk | head -60
@@ -245,14 +249,14 @@ jobs:
 
       - name: jadx decompile (Java layer)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p jadx_out
           jadx -d jadx_out --no-imports -q Muse.apk 2>&1 | tail -20 | tee artifacts/06_jadx.log || true
           find jadx_out -name '*.java' | wc -l | tee artifacts/jadx_java_count.txt
 
       - name: Deep API-usage grep on decompiled Java
         run: |
-          set -euo pipefail
+          set -uo pipefail
           {
             echo "### API 24+ symbols in decompiled Java"
             grep -rEn 'java\.util\.Optional|java\.time\.|java\.util\.stream\.|CompletableFuture|android\.icu\.|String\.join\(|Stream\.of\(|List\.of\(|Map\.of\(' jadx_out 2>/dev/null | head -80 || echo "(none)"
