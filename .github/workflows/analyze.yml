@@ -1,0 +1,338 @@
+name: Muse APK Android 6 Compatibility Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Direct APK download URL'
+        required: true
+        default: 'https://sv5.downloadyarbot.ir/IDM/Muse.app'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download APK (rename .app → .apk)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          echo "Downloading ${{ inputs.apk_url }}"
+          curl -fL --retry 3 -o original_download.bin "${{ inputs.apk_url }}"
+          # Identify actual type
+          file original_download.bin
+          xxd original_download.bin | head -5
+          # Rename to .apk regardless of extension
+          cp original_download.bin Muse.apk
+          ls -la Muse.apk
+          sha256sum Muse.apk | tee artifacts/apk_sha256.txt
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK + tools
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME=$HOME/android-sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd "$ANDROID_HOME/cmdline-tools"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-11076708_latest.zip
+          mv cmdline-tools latest
+          export PATH=$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-23" 2>/dev/null || true
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          # aapt2 comes from build-tools
+          sdkmanager "build-tools;34.0.0" 2>/dev/null || true
+          echo "aapt check:"; which aapt aapt2 zipalign apksigner 2>/dev/null || true
+
+      - name: Install analysis tools
+        run: |
+          set -euo pipefail
+          # apktool
+          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool
+          chmod +x /usr/local/bin/apktool
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar -O /usr/local/bin/apktool.jar
+          # jadx
+          JADX_VER=1.5.0
+          wget -q "https://github.com/skylot/jadx/releases/download/v${JADX_VER}/jadx-${JADX_VER}.zip"
+          unzip -q jadx-${JADX_VER}.zip -d $HOME/jadx
+          chmod +x $HOME/jadx/bin/jadx
+          echo "$HOME/jadx/bin" >> "$GITHUB_PATH"
+          # utility
+          sudo apt-get update -qq && sudo apt-get install -y -qq file xxd unzip zip python3
+          echo "== tool versions =="
+          apktool --version 2>/dev/null || echo "apktool version check failed"
+          jadx --version 2>/dev/null || echo "jadx version check failed"
+
+      - name: APK identity (badging / manifest summary)
+        run: |
+          set -euo pipefail
+          export PATH=$ANDROID_HOME/build-tools/34.0.0:$PATH
+          {
+            echo "### aapt badging"
+            aapt dump badging Muse.apk 2>&1 | head -80
+            echo
+            echo "### aapt permissions"
+            aapt dump permissions Muse.apk 2>&1 | head -60
+            echo
+            echo "### aapt configurations"
+            aapt dump configurations Muse.apk 2>&1 | head -40
+          } | tee artifacts/01_apk_identity.txt
+
+      - name: Full manifest dump (minSdk / targetSdk / components)
+        run: |
+          set -euo pipefail
+          mkdir -p decoded
+          apktool d -f -o decoded Muse.apk 2>&1 | tee artifacts/02_apktool_decode.log
+          if [ -f decoded/AndroidManifest.xml ]; then
+            cp decoded/AndroidManifest.xml artifacts/AndroidManifest.xml
+            echo "### minSdk / targetSdk / uses-sdk"
+            grep -nE 'uses-sdk|minSdkVersion|targetSdkVersion' decoded/AndroidManifest.xml | tee artifacts/03_sdk_levels.txt
+            echo
+            echo "### declared permissions"
+            grep -nE 'uses-permission' decoded/AndroidManifest.xml | head -60 | tee -a artifacts/03_sdk_levels.txt
+          else
+            echo "MANIFEST_DECODE_FAILED" > artifacts/03_sdk_levels.txt
+          fi
+
+      - name: Check APK structure / is it really an APK?
+        run: |
+          set -euo pipefail
+          {
+            echo "### zip contents (top-level)"
+            unzip -l Muse.apk | head -60
+            echo
+            echo "### native libs"
+            unzip -l Muse.apk | grep -E '\.so$' || echo "(no .so files)"
+            echo
+            echo "### assets of interest"
+            unzip -l Muse.apk | grep -E 'assets/bin/Data|global-metadata|\.dex$' || true
+          } | tee artifacts/04_apk_structure.txt
+
+      - name: Static compat analysis — Android 6 (API 23) blockers
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee artifacts/05_android6_compat.md
+          import re, os, zipfile, math
+          from xml.etree import ElementTree as ET
+
+          APK = "Muse.apk"
+          NS = '{http://schemas.android.com/apk/res/android}'
+          report = []
+          def w(s=""): report.append(s)
+
+          w("# Muse.app — Android 6 (API 23) Compatibility Report")
+          w()
+          w(f"APK: `{APK}`")
+          w()
+
+          # ---- read manifest from apktool output if available ----
+          manifest = None
+          mp = "decoded/AndroidManifest.xml"
+          if os.path.exists(mp):
+              manifest = open(mp, encoding='utf-8', errors='replace').read()
+
+          min_sdk = target_sdk = None
+          if manifest:
+              m = re.search(r'minSdkVersion(?:android:targetSdkVersion)?["\']?\s*(?:android:)?\S*', manifest)
+              for tag, setter in (("uses-sdk", None),):
+                  mm = re.search(r'<uses-sdk[^>]*>', manifest, re.S)
+                  if mm:
+                      tag = mm.group(0)
+                      a = re.search(NS+r'minSdkVersion="(\d+)"', tag)
+                      b = re.search(NS+r'targetSdkVersion="(\d+)"', tag)
+                      if a: min_sdk = int(a.group(1))
+                      if b: target_sdk = int(b.group(1))
+
+          w("## 1. SDK levels")
+          w()
+          w(f"- **minSdkVersion** = `{min_sdk}`")
+          w(f"- **targetSdkVersion** = `{target_sdk}`")
+          w()
+          ANDROID_RELEASE = {23:"Android 6.0 Marshmallow",24:"Android 7.0",25:"Android 7.1",26:"Android 8.0",28:"Android 9",29:"Android 10",30:"Android 11",31:"Android 12",33:"Android 13",34:"Android 14"}
+          if min_sdk is not None and min_sdk > 23:
+              w(f"⛔ **نتیجه اولیه:** برنامه حداقل API {min_sdk} ({ANDROID_RELEASE.get(min_sdk,'?')}) می‌خواد، ولی اندروید 6 = API 23 است. **نصبِ خام مسدود می‌شه** (Play Store/PackageInstaller از minSdk بالاتر جلوگیری می‌کنه).")
+          elif min_sdk is not None and min_sdk <= 23:
+              w(f"✅ minSdk ≤ 23 — از نظر سطح API نصب خام روی اندروید 6 مجاز است.")
+          else:
+              w("⚠️ minSdk استخراج نشد.")
+          w()
+
+          # ---- Java/dex API usage scan ----
+          w("## 2. APIهای ممنوعه روی API 23 (check at runtime/install)")
+          w()
+          z = zipfile.ZipFile(APK)
+          dexes = [n for n in z.namelist() if n.endswith('.dex')]
+          w(f"فایل‌های dex: `{dexes}`")
+          w()
+          total = 0
+          for d in dexes:
+              total += z.getinfo(d).file_size
+          w(f"حجم کل dex: `{total/1024/1024:.1f} MB`")
+          w()
+
+          # classes known to be API 24+ (Android 7+) — these cause VerifyError/ClassNotFoundException on API 23
+          BLOCKED = {
+            "java/util/Optional":"java.util.Optional (API 24)",
+            "java/util/stream/Stream":"java.util.stream (API 24)",
+            "java/util/stream/Collectors":"Collectors (API 24)",
+            "java/time/LocalDate":"java.time API (API 26)",
+            "java/time/Instant":"java.time API (API 26)",
+            "java/time/Duration":"java.time API (API 26)",
+            "java/util/concurrent/CompletableFuture":"CompletableFuture (API 24)",
+            "java/util/function/Function":"java.util.function (API 24)",
+            "java/util/Spliterator":"Spliterator (API 24)",
+            "java/lang/InvokeCookie":"invoke-polymorphic (API 26)",
+            "android/icu/":"android.icu (API 24, replaces com.android.icu)",
+            "android/webview/WebViewEntryPoint":"WebView split (API 28+)",
+          }
+          hits = []
+          data_all = b""
+          for d in dexes:
+              data_all += z.read(d)
+          for pat, label in BLOCKED.items():
+              if pat.encode() in data_all:
+                  hits.append(label)
+          w("### کلاس‌های API 24+ در dex:")
+          w()
+          if hits:
+              for h in hits:
+                  w(f"- ⚠️ {h}")
+              w()
+              w("این کلاس‌ها روی اندروید 6 وجود ندارن. اگر در کدِ در حال اجرا load بشن → `NoClassDefFoundError` / کرش.")
+          else:
+              w("هیچ‌کدوم از نشانه‌های کلاس‌های API 24+ در dex پیدا نشد ✅")
+          w()
+          del data_all
+
+          # ---- native libs ----
+          w("## 3. کتابخانه‌های نیتیو (ABI)")
+          w()
+          sos = [n for n in z.namelist() if n.endswith('.so')]
+          abis = sorted({n.split('/')[1] for n in sos if n.startswith('lib/') and n.count('/')>1})
+          w(f"ABIs موجود: `{abis}`")
+          w()
+          if "armeabi-v7a" in abis or "armeabi" in abis:
+              w("✅ حداقل یک ABI ۳۲بیتی برای CPU معمول اندروید 6 موجود است.")
+          elif "arm64-v8a" in abis:
+              w("ℹ️ فقط arm64-v8a. بیشتر دستگاه‌های اندروید 6 (Snapdragon 6xx/8xx) ۶۴بیتی هستن، ولی دستگاه‌های ۳۲بیتی (مثل بعضی MediaTek) کرش می‌کنن.")
+          elif "x86" in abis:
+              w("⚠️ فقط x86 — روی گوشی واقعی کار نمی‌کنه.")
+          else:
+              w("⚠️ ABI مشخص نیست.")
+          w()
+
+          # ---- entropy check on any metadata ----
+          w("## 4. بررسی محتوا (یونیتی /IL2CPP و غیره)")
+          w()
+          names = z.namelist()
+          if any('global-metadata.dat' in n for n in names):
+              w("- 🎮 برنامه **Unity IL2CPP** است. منطق اصلی C# در `libil2cpp.so` و metadata رمزنگاری‌شده ممکنه.")
+          if any('classes.dex' in n for n in names):
+              w("- ساختار استاندارد dex/JVM دارد.")
+          w()
+
+          print("\n".join(report))
+          PY
+
+      - name: jadx decompile (Java layer)
+        run: |
+          set -euo pipefail
+          mkdir -p jadx_out
+          jadx -d jadx_out --no-imports -q Muse.apk 2>&1 | tail -20 | tee artifacts/06_jadx.log || true
+          find jadx_out -name '*.java' | wc -l | tee artifacts/jadx_java_count.txt
+
+      - name: Deep API-usage grep on decompiled Java
+        run: |
+          set -euo pipefail
+          {
+            echo "### API 24+ symbols in decompiled Java"
+            grep -rEn 'java\.util\.Optional|java\.time\.|java\.util\.stream\.|CompletableFuture|android\.icu\.|String\.join\(|Stream\.of\(|List\.of\(|Map\.of\(' jadx_out 2>/dev/null | head -80 || echo "(none)"
+            echo
+            echo "### Runtime-version guards (Build.VERSION_CODES)"
+            grep -rEn 'Build\.VERSION_CODES\.[A-Z]+' jadx_out 2>/dev/null | sed -E 's/.*(VERSION_CODES\.[A-Z_]+).*/\1/' | sort | uniq -c | sort -rn | head -30 || echo "(none)"
+            echo
+            echo "### framework classes referenced (top)"
+            grep -rhoE 'android\.[a-z]+\.[A-Za-z0-9_.]+' jadx_out 2>/dev/null | sort | uniq -c | sort -rn | head -40 || echo "(none)"
+          } | tee artifacts/07_java_api_grep.txt
+
+      - name: Run dex-level raw string scan (in case jadx failed)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee artifacts/08_dex_strings.txt
+          import zipfile
+          z = zipfile.ZipFile("Muse.apk")
+          dexes = [n for n in z.namelist() if n.endswith('.dex')]
+          NEEDLES = [b"java/util/Optional", b"java/time/", b"java/util/stream/",
+                     b"java/util/concurrent/CompletableFuture", b"android/icu/",
+                     b"getExternalMediaDirs", b"android/app/NotificationChannel",
+                     b"android/graphics/AdaptiveIconDrawable", b"java/util/Objects"]
+          print("dex files:", dexes)
+          for d in dexes:
+              data = z.read(d)
+              print(f"\n== {d} ({len(data)/1024/1024:.1f}MB) ==")
+              for n in NEEDLES:
+                  if n in data:
+                      print("  HIT:", n.decode())
+          PY
+
+      - name: Final verdict — can it run on Android 6?
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee artifacts/00_VERDICT.md
+          import re, os
+          v = open('artifacts/05_android6_compat.md', encoding='utf-8', errors='replace').read()
+          print("="*70)
+          print("VERDICT — Muse.app on Android 6")
+          print("="*70)
+          m = re.search(r'minSdkVersion = `(\d+)`', v)
+          if m:
+              n = int(m.group(1))
+              if n > 23:
+                  print(f"\n⛔ minSdk={n} > 23 → اندروید 6 به صورت پیش‌فرض نصب رو رد می‌کنه.")
+                  print("   برای نصب: یا باید minSdk در manifest رو به 23 (یا کمتر) پچ کرد و دوباره امضا کرد،")
+                  print("   یا از ابزارهایی مثل AndroidManifest-Editor / apktool استفاده کرد.")
+                  print("   ولی توجه: این فقط در.Installer رو دور می‌زنه؛ اگر برنامه واقعاً به API 24+ نیاز داشته")
+                  print("   باشه، بعد از نصب هم کرش می‌کنه.")
+              else:
+                  print(f"\n✅ minSdk={n} ≤ 23 → از نظر Installer مشکلی نیست.")
+          hits = []
+          g = open('artifacts/07_java_api_grep.txt', encoding='utf-8', errors='replace').read()
+          for sym in ['java.time.','java.util.Optional','java.util.stream.','CompletableFuture','android.icu.']:
+              if sym in g:
+                  hits.append(sym)
+          if hits:
+              print("\n⚠️ نشونه‌های استفاده از API 24+ در کد جاوا پیدا شد:", hits)
+              print("   این نشانه اینه که برنامه روی اندروید 6 ممکنه کرش کنه (اگر اون مسیر کد اجرا بشه).")
+          else:
+              print("\n✅ هیچ نشانه‌ای از استفاده API 24+ در کد جاوا پیدا نشد.")
+          print("\nفایل‌های کامل گزارش در artifacts/ هستند.")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse-analysis
+          path: artifacts/
+          if-no-files-found: warn
+
+      - name: Commit report to repo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp -r artifacts docs 2>/dev/null || mkdir -p docs && cp -r artifacts/* docs/ 2>/dev/null || true
+          git add docs artifacts 2>/dev/null || true
+          git add -A
+          git commit -m "Add Muse.app Android 6 compatibility analysis" || echo "nothing to commit"
+          git push || echo "push skipped"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
