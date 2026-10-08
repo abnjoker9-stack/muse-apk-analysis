@@ -77,8 +77,9 @@ jobs:
           jadx --version 2>/dev/null || echo "jadx version check failed"
 
       - name: APK identity (badging / manifest summary)
+        shell: bash
         run: |
-          set -euo pipefail
+          set +e
           export PATH=$ANDROID_HOME/build-tools/34.0.0:$PATH
           {
             echo "### aapt badging"
@@ -89,27 +90,44 @@ jobs:
             echo
             echo "### aapt configurations"
             aapt dump configurations Muse.apk 2>&1 | head -40
-          } | tee artifacts/01_apk_identity.txt
+          } > artifacts/01_apk_identity.txt 2>&1
+          echo "done"
 
       - name: Full manifest dump (minSdk / targetSdk / components)
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
           mkdir -p decoded
-          apktool d -f -o decoded Muse.apk 2>&1 | tee artifacts/02_apktool_decode.log || true
+          apktool d -f -o decoded Muse.apk > artifacts/02_apktool_decode.log 2>&1
+          echo "apktool exit: $?"
           if [ -f decoded/AndroidManifest.xml ]; then
             cp decoded/AndroidManifest.xml artifacts/AndroidManifest.xml
-            echo "### minSdk / targetSdk / uses-sdk"
-            grep -nE 'uses-sdk|minSdkVersion|targetSdkVersion' decoded/AndroidManifest.xml | tee artifacts/03_sdk_levels.txt
-            echo
-            echo "### declared permissions"
-            grep -nE 'uses-permission' decoded/AndroidManifest.xml | head -60 | tee -a artifacts/03_sdk_levels.txt
+            {
+              echo "### manifest head (raw)"
+              head -c 2000 decoded/AndroidManifest.xml
+              echo
+              echo "### uses-sdk"
+              grep -nE 'uses-sdk|minSdk|targetSdk' decoded/AndroidManifest.xml || echo "(no uses-sdk tag found — manifest may use nonstandard form)"
+              echo
+              echo "### declared permissions"
+              grep -nE 'uses-permission' decoded/AndroidManifest.xml | head -60 || echo "(none)"
+              echo
+              echo "### activities / services count"
+              grep -cE '<activity' decoded/AndroidManifest.xml || true
+              grep -cE '<service' decoded/AndroidManifest.xml || true
+              grep -cE '<receiver' decoded/AndroidManifest.xml || true
+            } > artifacts/03_sdk_levels.txt 2>&1
+            echo "manifest dump written"
           else
             echo "MANIFEST_DECODE_FAILED" > artifacts/03_sdk_levels.txt
           fi
+          echo "step done"
+          exit 0
 
       - name: Check APK structure / is it really an APK?
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
           {
             echo "### zip contents (top-level)"
             unzip -l Muse.apk | head -60
@@ -119,12 +137,14 @@ jobs:
             echo
             echo "### assets of interest"
             unzip -l Muse.apk | grep -E 'assets/bin/Data|global-metadata|\.dex$' || true
-          } | tee artifacts/04_apk_structure.txt
+          } > artifacts/04_apk_structure.txt 2>&1
+          echo "done"
 
       - name: Static compat analysis — Android 6 (API 23) blockers
+        shell: bash
         run: |
-          set -uo pipefail
-          python3 - <<'PY' 2>&1 | tee artifacts/05_android6_compat.md
+          set +e
+          python3 - <<'PY' > artifacts/05_android6_compat.md 2>&1
           import re, os, zipfile, math
           from xml.etree import ElementTree as ET
 
@@ -248,15 +268,19 @@ jobs:
           PY
 
       - name: jadx decompile (Java layer)
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
           mkdir -p jadx_out
-          jadx -d jadx_out --no-imports -q Muse.apk 2>&1 | tail -20 | tee artifacts/06_jadx.log || true
+          jadx -d jadx_out --no-imports -q Muse.apk > artifacts/06_jadx.log 2>&1
+          echo "jadx exit: $?"
           find jadx_out -name '*.java' | wc -l | tee artifacts/jadx_java_count.txt
+          echo "done"
 
       - name: Deep API-usage grep on decompiled Java
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
           {
             echo "### API 24+ symbols in decompiled Java"
             grep -rEn 'java\.util\.Optional|java\.time\.|java\.util\.stream\.|CompletableFuture|android\.icu\.|String\.join\(|Stream\.of\(|List\.of\(|Map\.of\(' jadx_out 2>/dev/null | head -80 || echo "(none)"
@@ -266,12 +290,14 @@ jobs:
             echo
             echo "### framework classes referenced (top)"
             grep -rhoE 'android\.[a-z]+\.[A-Za-z0-9_.]+' jadx_out 2>/dev/null | sort | uniq -c | sort -rn | head -40 || echo "(none)"
-          } | tee artifacts/07_java_api_grep.txt
+          } > artifacts/07_java_api_grep.txt 2>&1
+          echo "done"
 
       - name: Run dex-level raw string scan (in case jadx failed)
+        shell: bash
         run: |
-          set -uo pipefail
-          python3 - <<'PY' 2>&1 | tee artifacts/08_dex_strings.txt
+          set +e
+          python3 - <<'PY' > artifacts/08_dex_strings.txt 2>&1
           import zipfile
           z = zipfile.ZipFile("Muse.apk")
           dexes = [n for n in z.namelist() if n.endswith('.dex')]
@@ -289,9 +315,10 @@ jobs:
           PY
 
       - name: Final verdict — can it run on Android 6?
+        shell: bash
         run: |
-          set -uo pipefail
-          python3 - <<'PY' 2>&1 | tee artifacts/00_VERDICT.md
+          set +e
+          python3 - <<'PY' > artifacts/00_VERDICT.md 2>&1
           import re, os
           v = open('artifacts/05_android6_compat.md', encoding='utf-8', errors='replace').read()
           print("="*70)
@@ -329,8 +356,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit report to repo
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           cp -r artifacts docs 2>/dev/null || mkdir -p docs && cp -r artifacts/* docs/ 2>/dev/null || true
